@@ -1,0 +1,306 @@
+---@diagnostic disable
+-- AutoStrafe.lua
+-- Author: intext
+local group = Menu.Create("Miscellaneous", "", "AutoStrafe", "Main", "AutoStrafe")
+pcall(function() Menu.Find("Miscellaneous", "", "AutoStrafe"):Icon("\u{e551}") end)
+
+local ui = {}
+ui.enable = group:Switch("AutoStrafe", false, "\u{e551}")
+ui.enable:ToolTip("Auto-Strafer. Recommended to \a{primary}bind.")
+
+ui.settings   = ui.enable:Gear("Settings")
+ui.correction = ui.settings:Switch("ViewAngles Correction", true, "\u{f737}")
+ui.correction:ToolTip("Override viewangles with the live camera angles for cleaner strafing.")
+ui.hold       = ui.settings:Slider("Strafe Hold (ticks)", 0, 5, 0, "%d", "\u{f017}")
+ui.hold:ToolTip("How many ticks to hold each side before flipping direction (0 = every tick).")
+
+local EMoveType <const> = {
+    MOVETYPE_NONE = 0x00,
+    MOVETYPE_OBSOLETE = 0x01,
+    MOVETYPE_WALK = 0x02,
+    MOVETYPE_FLY = 0x03,
+    MOVETYPE_FLYGRAVITY = 0x04,
+    MOVETYPE_VPHYSICS = 0x05,
+    MOVETYPE_PUSH = 0x06,
+    MOVETYPE_NOCLIP = 0x07,
+    MOVETYPE_OBSERVER = 0x08,
+    MOVETYPE_STEP = 0x09,
+    MOVETYPE_SYNC = 0x0A,
+    MOVETYPE_CUSTOM = 0x0B,
+    MOVETYPE_LAST = 0x0C,
+    MOVETYPE_INVALID = 0x0C,
+    MOVETYPE_MAX_BITS = 0x05,
+}
+
+local direction = false
+
+local function normalize_yaw(yaw)
+    while yaw > 180 do
+        yaw = yaw - 360
+    end
+    while yaw < -180 do
+        yaw = yaw + 360
+    end
+    return yaw
+end
+
+local AIR_MAX_WISHSPEED = 30.0
+
+local function get_airaccelerate()
+    local ok, v = pcall(function()
+        local cv = convar and convar.sv_airaccelerate
+        if cv and cv.float then
+            return cv:float()
+        end
+        return nil
+    end)
+    if ok and type(v) == "number" and v > 0 then
+        return v
+    end
+    return 10.0
+end
+
+local function get_tick_interval()
+    if global_vars and global_vars.interval_per_tick then
+        local dt = global_vars.interval_per_tick()
+        if dt and dt > 0 then
+            return dt
+        end
+    end
+    return 1.0 / 64.0
+end
+
+local function rotate_movement(cmd1, target_yaw)
+    local rot = math.rad(cmd1.viewangles.yaw - target_yaw)
+    local cos_rot = math.cos(rot)
+    local sin_rot = math.sin(rot)
+
+    local new_forward = cos_rot * cmd1.forwardmove - sin_rot * cmd1.leftmove
+    local new_side = sin_rot * cmd1.forwardmove + cos_rot * cmd1.leftmove
+
+    local movement_mask = InputBitMask_t.IN_BACK | InputBitMask_t.IN_FORWARD | InputBitMask_t.IN_MOVELEFT | InputBitMask_t.IN_MOVERIGHT
+    cmd1.button_state0 = cmd1.button_state0 & ~movement_mask
+    cmd1.button_state1 = cmd1.button_state1 & ~movement_mask
+
+    cmd1.forwardmove = math.clamp(new_forward, -1, 1)
+    cmd1.leftmove = math.clamp(new_side * -1, -1, 1)
+
+    if cmd1.forwardmove > 0 then
+        cmd1:add_buttonstate1(InputBitMask_t.IN_FORWARD)
+        cmd1:add_buttonstate2(InputBitMask_t.IN_FORWARD)
+    elseif cmd1.forwardmove < 0 then
+        cmd1:add_buttonstate1(InputBitMask_t.IN_BACK)
+        cmd1:add_buttonstate2(InputBitMask_t.IN_BACK)
+    end
+
+    if cmd1.leftmove > 0 then
+        cmd1:add_buttonstate1(InputBitMask_t.IN_MOVELEFT)
+        cmd1:add_buttonstate2(InputBitMask_t.IN_MOVELEFT)
+    elseif cmd1.leftmove < 0 then
+        cmd1:add_buttonstate1(InputBitMask_t.IN_MOVERIGHT)
+        cmd1:add_buttonstate2(InputBitMask_t.IN_MOVERIGHT)
+    end
+end
+
+AUTO_STRAFE = AUTO_STRAFE or {}
+AUTO_STRAFE.is_auto_strafing = false
+AUTO_STRAFE.tick_counter = AUTO_STRAFE.tick_counter or 0
+
+local function auto_strafe(cmd, local_pawn, is_on_ground)
+    if is_on_ground then
+        AUTO_STRAFE.tick_counter = 0
+        return
+    end
+
+    AUTO_STRAFE.is_auto_strafing = true
+
+    if ui.correction:Get() then
+        local angles = utils.get_camera_angles()
+        angles:Normalize()
+        cmd.viewangles = angles
+    end
+
+    local view_yaw = normalize_yaw(cmd.viewangles.yaw)
+
+    local current_buttons = cmd.button_state0
+    local key_offset = 0
+    if (current_buttons & InputBitMask_t.IN_MOVELEFT) ~= 0 then
+        key_offset = key_offset + 90
+    end
+    if (current_buttons & InputBitMask_t.IN_MOVERIGHT) ~= 0 then
+        key_offset = key_offset - 90
+    end
+    if (current_buttons & InputBitMask_t.IN_FORWARD) ~= 0 then
+        key_offset = key_offset * 0.5
+    elseif (current_buttons & InputBitMask_t.IN_BACK) ~= 0 then
+        key_offset = -key_offset * 0.5 + 180
+    end
+
+    local intended_yaw = normalize_yaw(view_yaw + key_offset)
+
+    local velocity = local_pawn:get_velocity()
+    local speed = velocity:Length2D()
+    local velocity_angle = math.deg(math.atan2(velocity.y, velocity.x))
+
+    local airaccel = get_airaccelerate()
+    local dt = get_tick_interval()
+    local delta_v = airaccel * AIR_MAX_WISHSPEED * dt
+    local C = AIR_MAX_WISHSPEED - delta_v
+    if C < 15.0 then C = 15.0 end
+    if C > AIR_MAX_WISHSPEED then C = AIR_MAX_WISHSPEED end
+
+    local ideal
+    if speed > C then
+        ideal = math.deg(math.asin(C / speed))
+    else
+        ideal = 90.0
+    end
+    ideal = math.clamp(ideal, 0.0, 90.0)
+    local velocity_to_intended = normalize_yaw(intended_yaw - velocity_angle)
+    local user_hold = ui.hold:Get()
+    local hold_ticks
+    if user_hold and user_hold > 0 then
+        hold_ticks = user_hold
+    else
+        hold_ticks = 1
+    end
+
+    cmd.forwardmove = 0
+    cmd.leftmove = 0
+
+    local sidemove
+    local strafe_yaw
+    if speed > 30.0 and math.abs(velocity_to_intended) > ideal then
+        if velocity_to_intended > 0 then
+            sidemove = -1
+            strafe_yaw = velocity_angle - ideal
+        else
+            sidemove = 1
+            strafe_yaw = velocity_angle + ideal
+        end
+        AUTO_STRAFE.tick_counter = 0
+    else
+        AUTO_STRAFE.tick_counter = (AUTO_STRAFE.tick_counter or 0) + 1
+        if AUTO_STRAFE.tick_counter >= hold_ticks then
+            direction = not direction
+            AUTO_STRAFE.tick_counter = 0
+        end
+        if direction then
+            sidemove = -1
+            strafe_yaw = intended_yaw - ideal
+        else
+            sidemove = 1
+            strafe_yaw = intended_yaw + ideal
+        end
+    end
+
+    cmd.leftmove = sidemove
+    rotate_movement(cmd, normalize_yaw(strafe_yaw))
+end
+local function get_movement_status(lp)
+    local move_type = lp.m_nActualMoveType
+    if not HERO_LIB.is_lp_alive or move_type == EMoveType.MOVETYPE_NOCLIP then
+        return { can_move = false }
+    end
+
+    local can_move = true
+
+    if HERO_LIB.is_in_ethereal_shift(lp) then
+        can_move = false
+    end
+
+    if can_move then
+        local bad_move_modifiers = {
+            "ability_guided_arrow/modifier_guiding_arrow",
+            "ability_power_jump/modifier_power_jump",
+            "ability_nano_shadow_pulse/modifier_nano_shadowpulse",
+            "mirage_tornado/modifier_mirage_tornado_caster",
+        }
+        for i = 1, #bad_move_modifiers do
+            local modifier = bad_move_modifiers[i]
+            if lp:has_modifier(modifier) then
+                can_move = false
+                break
+            end
+        end
+    end
+
+    if can_move then
+        local bad_move_states = {
+            EModifierState.MODIFIER_STATE_COMMAND_RESTRICTED,
+            EModifierState.MODIFIER_STATE_BUSY_WITH_ACTION,
+            EModifierState.MODIFIER_STATE_AIR_DASHING,
+            EModifierState.MODIFIER_STATE_GROUND_DASHING,
+            EModifierState.MODIFIER_STATE_IS_CLIMBING_ROPE,
+            EModifierState.MODIFIER_STATE_FLYING,
+            EModifierState.MODIFIER_STATE_OUT_OF_GAME,
+            EModifierState.MODIFIER_STATE_VISCOUS_CUBED,
+        }
+        for i = 1, #bad_move_states do
+            local state = bad_move_states[i]
+            if lp:has_modifier_state(state) then
+                can_move = false
+                break
+            end
+        end
+    end
+
+    if can_move then
+        local bad_ability_names =
+            { "citadel_ability_bebop_laser_beam", "ability_charged_shot", "citadel_ability_tengu_airlift", "ability_icepath", "synth_barrage", "ability_familiar_ability01" }
+        if HERO_LIB.is_channeling_specific_abilities(lp, bad_ability_names) or HERO_LIB.is_in_cast_delay_specific_abilities(lp, bad_ability_names) then
+            can_move = false
+        end
+    end
+
+    return { can_move = can_move }
+end
+local need_dash = false
+local last_pressed = false
+
+callback.on_createmove:set(function(cmd)
+    AUTO_STRAFE.is_auto_strafing = false
+
+    if not ui.enable:Get() then
+        return
+    end
+
+    local skip = false
+
+    if need_dash then
+        cmd:add_buttonstate1(InputBitMask_t.IN_INNATE_1)
+        cmd:add_buttonstate2(InputBitMask_t.IN_INNATE_1)
+
+        need_dash = false
+        last_pressed = true
+
+        skip = true
+    else
+        local manual_press_dash = (cmd.button_state0 & InputBitMask_t.IN_INNATE_1) ~= 0
+        if manual_press_dash then
+            if not last_pressed then
+                cmd:clear_buttonstate1(InputBitMask_t.IN_INNATE_1)
+                cmd:clear_buttonstate2(InputBitMask_t.IN_INNATE_1)
+
+                need_dash = true
+                last_pressed = true
+
+                skip = true
+            end
+        else
+            last_pressed = false
+        end
+    end
+
+    if not skip then
+        local lp = HERO_LIB.lp
+        if lp then
+            local is_on_ground = HERO_LIB.is_on_ground(lp)
+            local movement_status = get_movement_status(lp)
+
+            if movement_status.can_move then
+                auto_strafe(cmd, lp, is_on_ground)
+            end
+        end
+    end
+end)
